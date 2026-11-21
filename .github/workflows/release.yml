@@ -315,7 +315,7 @@ jobs:
           app=${apps[0]}
           codesign --verify --deep --strict "$app"
           executable=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$app/Contents/Info.plist")
-          node scripts/smoke-desktop-app.ts --fork --executable "$app/Contents/MacOS/$executable" \
+          node scripts/smoke-desktop-app.ts --executable "$app/Contents/MacOS/$executable" \
             --artifacts-dir "$RUNNER_TEMP/desktop-launch-check"
 
       - name: Upload launch check output
