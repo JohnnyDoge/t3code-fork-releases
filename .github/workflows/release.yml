@@ -1,0 +1,282 @@
+name: Fork desktop release
+
+on:
+  schedule:
+    - cron: "43 6 * * 0"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if main is already released
+        type: boolean
+        default: false
+
+concurrency:
+  group: fork-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FORK_RELEASE_TAGS_QUERY: >-
+    .[] | select(.isPrerelease and .name == ("T3 Code Fork " + .tagName)) |
+    .tagName | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+-nightly\\.[0-9]{8}\\.[0-9]+$"))
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    if: github.repository == 'JohnnyDoge/t3code-fork-releases' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      source_sha: ${{ steps.release.outputs.source_sha }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ vars.FORK_REPOSITORY || 'JohnnyDoge/t3code' }}
+          ref: refs/heads/main
+          persist-credentials: false
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Vite+
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install: "false"
+
+      - name: Plan release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          FORCE: ${{ inputs.force }}
+          FORK_REPOSITORY: ${{ vars.FORK_REPOSITORY || 'JohnnyDoge/t3code' }}
+        run: |
+          source_sha=$(git rev-parse HEAD)
+          notes="Desktop build from https://github.com/$FORK_REPOSITORY/commit/$source_sha."
+          previous_tags=$(gh release list --exclude-drafts --limit 100 --json tagName,name,isPrerelease \
+            --jq "$FORK_RELEASE_TAGS_QUERY" | sort -Vr)
+          previous_tag=${previous_tags%%$'\n'*}
+          if [[ -n $previous_tag && $FORCE != true ]]; then
+            previous_notes=$(gh release view "$previous_tag" --json body --jq .body)
+            if [[ $previous_notes == "$notes" ]]; then
+              echo "Fork main is already released as $previous_tag."
+              exit 0
+            fi
+          fi
+
+          upstream_tag=$(bash scripts/fork/upstream-base.sh)
+          official_tags=$(gh release list --repo pingdotgg/t3code --exclude-drafts --limit 100 \
+            --json tagName,isPrerelease --jq '.[] | select(.isPrerelease) | .tagName' |
+            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-nightly\.[0-9]{8}\.[0-9]+$' | sort -Vr)
+          official_tag=${official_tags%%$'\n'*}
+          version=$(node scripts/fork/release-version.ts "$upstream_tag" "$(date -u +%Y%m%d)" \
+            "$GITHUB_RUN_NUMBER" "$previous_tag" "$official_tag")
+          printf 'source_sha=%s\nversion=%s\n' "$source_sha" "$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.platform }} ${{ matrix.arch }}
+    needs: plan
+    if: needs.plan.outputs.version != ''
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: mac
+            arch: arm64
+            runner: macos-15
+            rust_target: aarch64-apple-darwin
+            resource_monitor: t3-resource-monitor
+          - platform: win
+            arch: x64
+            runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            resource_monitor: t3-resource-monitor.exe
+    steps:
+      - name: Enable Git long paths
+        if: matrix.platform == 'win'
+        run: git config --global core.longpaths true
+
+      - name: Checkout fork source commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ vars.FORK_REPOSITORY || 'JohnnyDoge/t3code' }}
+          ref: ${{ needs.plan.outputs.source_sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Cache native resource monitor
+        id: resource_monitor
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: native/resource-monitor/target/${{ matrix.rust_target }}/release/${{ matrix.resource_monitor }}
+          key: fork-resource-monitor-${{ matrix.rust_target }}-${{ hashFiles('.cargo/config.toml', 'native/resource-monitor/Cargo.lock', 'native/resource-monitor/Cargo.toml', 'native/resource-monitor/src/**') }}
+
+      - name: Setup Rust
+        if: steps.resource_monitor.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.rust_target }}
+
+      - name: Build native resource monitor
+        if: steps.resource_monitor.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: cargo build --locked --release --manifest-path native/resource-monitor/Cargo.toml --target "$RUST_TARGET"
+
+      - name: Build and sign macOS desktop artifacts
+        if: matrix.platform == 'mac'
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: "true"
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+          FORK_MAC_CERT_P12_BASE64: ${{ secrets.FORK_MAC_CERT_P12_BASE64 }}
+          FORK_MAC_CERT_PASSWORD: ${{ secrets.FORK_MAC_CERT_PASSWORD }}
+        run: node scripts/fork/build-desktop.ts --platform mac --arch arm64 --version "$VERSION" --out "$RUNNER_TEMP/fork-desktop"
+
+      - name: Build Windows desktop artifacts
+        if: matrix.platform == 'win'
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: "true"
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+        run: node scripts/fork/build-desktop.ts --platform win --arch x64 --version "$VERSION" --out "$RUNNER_TEMP/fork-desktop"
+
+      - name: Upload desktop artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-desktop-${{ matrix.platform }}
+          path: ${{ runner.temp }}/fork-desktop/
+          if-no-files-found: error
+          include-hidden-files: true
+          compression-level: 0
+          overwrite: true
+
+  publish:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout fork release validator
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ vars.FORK_REPOSITORY || 'JohnnyDoge/t3code' }}
+          ref: ${{ needs.plan.outputs.source_sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/fork
+
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: fork-desktop-*
+          path: release-assets
+
+      - name: Validate both update manifests
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: ruby scripts/fork/validate-release.rb "$VERSION" release-assets > validated-assets.txt
+
+      - name: Publish validated prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_REF: ${{ github.sha }}
+          FORK_REPOSITORY: ${{ vars.FORK_REPOSITORY || 'JohnnyDoge/t3code' }}
+          SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          tag="v$VERSION"
+          notes="Desktop build from https://github.com/$FORK_REPOSITORY/commit/$SOURCE_SHA."
+          mapfile -t assets < validated-assets.txt
+          existing=$(gh release view "$tag" --json name,isDraft,targetCommitish,body \
+            --jq '[.name, (.isDraft | tostring), .targetCommitish, .body] | @tsv' \
+            2>/dev/null) || existing=
+          tag_ref=$(git ls-remote --tags "https://github.com/$GH_REPO.git" "refs/tags/$tag" "refs/tags/$tag^{}")
+          if [[ -z $existing && -n $tag_ref ]]; then
+            echo "::error::Release tag $tag already exists without a fork release."
+            exit 1
+          fi
+          if [[ -n $tag_ref && $(tail -n 1 <<< "$tag_ref" | cut -f1) != "$RELEASE_REF" ]]; then
+            echo "::error::Release tag $tag points at a different commit."
+            exit 1
+          fi
+          case "$existing" in
+            "")
+              gh release create "$tag" --draft --prerelease --latest=false --target "$RELEASE_REF" \
+                --title "T3 Code Fork $tag" --notes "$notes" "${assets[@]}"
+              ;;
+            "T3 Code Fork $tag"$'\t'true$'\t'"$RELEASE_REF"$'\t'"$notes")
+              gh release upload "$tag" --clobber "${assets[@]}"
+              ;;
+            *) echo "::error::Release $tag already exists." && exit 1 ;;
+          esac
+          expected=$(printf '%s\n' "${assets[@]##*/}" | sort)
+          uploaded=$(gh release view "$tag" --json assets --jq '.assets[].name' | sort)
+          if [[ $uploaded != "$expected" ]]; then
+            echo "::error::Draft release assets differ from the validated files."
+            exit 1
+          fi
+          gh release edit "$tag" --draft=false --prerelease --latest=false
+
+  update-feed:
+    needs: [plan, publish]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.publish.result == 'success' || needs.plan.outputs.version == '') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the nightly update pointer and retain eight releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_REF: ${{ github.sha }}
+        run: |
+          published=$(gh release list --exclude-drafts --limit 100 --json tagName,name,isPrerelease \
+            --jq "$FORK_RELEASE_TAGS_QUERY" | sort -Vru)
+          tag=${published%%$'\n'*}
+          [[ -n $tag ]] || exit 0
+          version=${tag#v}
+          mac="T3-Code-$version-arm64"
+          win="T3-Code-$version-x64"
+          for asset in nightly-mac.yml "$mac.zip" "$mac.zip.blockmap" "$mac.dmg" "$mac.dmg.blockmap" \
+                       nightly.yml "$win.exe" "$win.exe.blockmap"; do
+            curl --fail --silent --show-error --location --head --output /dev/null \
+              --retry 4 --retry-all-errors --max-time 30 "https://github.com/$GH_REPO/releases/download/$tag/$asset"
+          done
+
+          gh release view "$tag" --json tagName,name,body --jq '{tag_name: .tagName, name, body}' > nightly.json
+          gh release view update-feed > /dev/null 2>&1 ||
+            gh release create update-feed --draft --prerelease --latest=false --target "$RELEASE_REF" --title "Update feed" \
+              --notes "The desktop updater uses this release to find the newest fork nightly."
+          gh release upload update-feed nightly.json --clobber
+          gh release edit update-feed --draft=false --prerelease --latest=false
+
+          expired=$(tail -n +9 <<< "$published")
+          while IFS= read -r previous; do
+            [[ -n $previous ]] || continue
+            gh release delete "$previous" --cleanup-tag --yes
+          done <<< "$expired"
