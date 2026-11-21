@@ -40,11 +40,14 @@ jobs:
         with:
           repository: ${{ vars.FORK_REPOSITORY || 'JohnnyDoge/t3code' }}
           ref: refs/heads/main
-          persist-credentials: false
           sparse-checkout: |
             /*
             !/.repos/
           sparse-checkout-cone-mode: false
+
+      # Disabling persisted credentials breaks on the vendored gitlinks under .repos.
+      - name: Drop checkout credentials
+        uses: ./.github/actions/drop-checkout-credentials
 
       - name: Setup Vite+
         uses: ./.github/actions/setup-ci-deps
@@ -111,11 +114,14 @@ jobs:
         with:
           repository: ${{ vars.FORK_REPOSITORY || 'JohnnyDoge/t3code' }}
           ref: ${{ needs.plan.outputs.source_sha }}
-          persist-credentials: false
           sparse-checkout: |
             /*
             !/.repos/
           sparse-checkout-cone-mode: false
+
+      # Disabling persisted credentials breaks on the vendored gitlinks under .repos.
+      - name: Drop checkout credentials
+        uses: ./.github/actions/drop-checkout-credentials
 
       - name: Setup dependencies
         uses: ./.github/actions/setup-ci-deps
@@ -185,8 +191,12 @@ jobs:
         with:
           repository: ${{ vars.FORK_REPOSITORY || 'JohnnyDoge/t3code' }}
           ref: ${{ needs.plan.outputs.source_sha }}
-          persist-credentials: false
-          sparse-checkout: scripts/fork
+          sparse-checkout: |
+            scripts/fork
+            .github/actions
+
+      - name: Drop checkout credentials
+        uses: ./.github/actions/drop-checkout-credentials
 
       - name: Download desktop artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
