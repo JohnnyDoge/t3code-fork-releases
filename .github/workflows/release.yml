@@ -315,7 +315,7 @@ jobs:
           app=${apps[0]}
           codesign --verify --deep --strict "$app"
           executable=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$app/Contents/Info.plist")
-          node scripts/smoke-desktop-app.ts --executable "$app/Contents/MacOS/$executable" \
+          node scripts/smoke-desktop-app.ts --fork --executable "$app/Contents/MacOS/$executable" \
             --artifacts-dir "$RUNNER_TEMP/desktop-launch-check"
 
       - name: Upload launch check output
@@ -383,7 +383,7 @@ jobs:
           tar -C verify -xf verify/unpacked.tar
           node verify/verify-windows-desktop-artifact.mjs \
             --app-dir "$(cygpath -w "$PWD/verify/win-unpacked")" \
-            --arch x64 --build-version "$VERSION" --verbose
+            --arch x64 --build-version "$VERSION" --fork --verbose
 
       - name: Smoke-test resource monitor
         shell: bash
